@@ -2,8 +2,10 @@ name: Weekly uptime check
 
 on:
   schedule:
-    # Friday 01:00 UTC = Friday 09:00 Asia/Manila (UTC+8)
-    - cron: '0 1 * * 5'
+    # Primary: Friday 01:17 UTC = Friday 09:17 Asia/Manila (UTC+8)
+    - cron: '17 1 * * 5'
+    # Backup: Friday 04:17 UTC = Friday 12:17 Asia/Manila (runs 3 hrs later in case GitHub skips the primary)
+    - cron: '17 4 * * 5'
   workflow_dispatch: {}
 
 jobs:
