@@ -16,10 +16,36 @@ Edit `sites.txt`, one URL per line. Lines starting with `#` are ignored, so a
 site that is temporarily dead can be commented out with a dated reason instead
 of being deleted.
 
-## What counts as a failure
+## How a verdict is reached
 
-A site is only reported after it fails **twice**, with a short pause between
-attempts, so a single blip does not raise an alert.
+**One GitHub runner is not a reliable witness.** Its egress IP is random per
+job, and some servers firewall parts of the Azure range, so a runner can fail to
+open a connection to a site that is serving everyone else perfectly. Measured
+2026-08-21: five parallel jobs got five distinct egress IPs, and three reached
+`34.174.188.233` while two were blocked at the same instant.
+
+The asymmetry that matters: **reaching a site proves it is serving, but failing
+to reach it proves nothing on its own.** So the check runs in three phases.
+
+1. `check`, one runner tests every site.
+2. `verify`, if anything failed, four more runners retest only the failures.
+3. `report`, the verdicts are merged and posted to Slack.
+
+A site is called **DOWN only when every vantage point failed.** If any single
+one reached it, the site is up and the failure belonged to that runner.
+
+Each site is also tried twice within a vantage, with a pause between, so a
+single blip never reaches the alert.
+
+### The three verdicts
+
+| Verdict | Meaning | Renders as |
+|---|---|---|
+| DOWN | Every vantage point failed | Red alert |
+| Blocked from some runners | Some reached it, the others could not open a connection | Not an outage, informational |
+| Intermittent | Some reached it, the others got a slow response or an error | Warning |
+
+## What counts as a failure at a single vantage
 
 - HTTP status 400 or higher
 - DNS failure (the hostname does not resolve)

@@ -8,20 +8,80 @@ on:
     - cron: '17 4 * * 5'
   workflow_dispatch: {}
 
+# A single runner is not a reliable witness: its egress IP is random per job,
+# and some servers firewall parts of the Azure range, so a runner can fail to
+# open a connection to a site that is serving everyone else. Failures are
+# therefore re-tested from four more runners, and a site is only called DOWN
+# when every vantage point failed.
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      has_failures: ${{ steps.run.outputs.has_failures }}
+      failures: ${{ steps.run.outputs.failures }}
     steps:
       - uses: actions/checkout@v5
-
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: pip
-
       - run: pip install -r requirements.txt
+      - id: run
+        run: python check_sites.py check --out result-check.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-check
+          path: result-check.json
+          retention-days: 7
 
-      - run: python check_sites.py
+  verify:
+    needs: check
+    if: needs.check.outputs.has_failures == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        vantage: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Re-test the failing sites from an independent runner
+        run: |
+          python check_sites.py verify \
+            --urls '${{ needs.check.outputs.failures }}' \
+            --label 'verify-${{ matrix.vantage }}' \
+            --out 'result-verify-${{ matrix.vantage }}.json'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-verify-${{ matrix.vantage }}
+          path: result-verify-${{ matrix.vantage }}.json
+          retention-days: 7
+
+  report:
+    needs: [check, verify]
+    # verify is skipped when nothing failed, so this must not require it to
+    # have succeeded. It must still not run if the check job itself broke.
+    if: always() && needs.check.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          path: results
+          pattern: result-*
+          merge-multiple: true
+      - run: python check_sites.py report --results-dir results
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

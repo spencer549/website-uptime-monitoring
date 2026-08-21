@@ -1,3 +1,5 @@
+import argparse
+import json
 import os
 import socket
 import sys
@@ -119,75 +121,233 @@ def check(url):
             "ip": ip, "attempts": ATTEMPTS}
 
 
-def send_slack(webhook_url, failures, total):
-    if failures:
-        lines = [f":rotating_light: *Uptime check: {len(failures)} of {total} sites failing*", ""]
-        for f in failures:
-            # reason already carries the timing for slow/timeout cases
-            timing = "" if "s)" in f["reason"] else f" ({f['elapsed']:.1f}s)"
-            ip = f" · {f['ip']}" if f["ip"] else ""
-            lines.append(f"• <{f['url']}|{f['url']}> · {f['reason']}{timing}{ip}")
-        if len(failures) == total and total > 2:
-            lines += ["", ":warning: _Every site failed. That usually means a "
-                      "monitor-side network problem, not 20 real outages._"]
-        else:
-            by_ip = defaultdict(list)
-            for f in failures:
-                if f["ip"]:
-                    by_ip[f["ip"]].append(f["url"])
-            shared = {ip: u for ip, u in by_ip.items() if len(u) > 1}
-            if shared:
-                lines.append("")
-                for ip, urls in shared.items():
-                    lines.append(f"_Note: {len(urls)} of these share server {ip}, "
-                                 f"so one host is likely the cause._")
-        lines += ["", f"_Each site was tried {ATTEMPTS}x before being reported._"]
+# ---------------------------------------------------------------------------
+# Phases.
+#
+# A single GitHub runner is not a reliable witness. Its egress IP is random per
+# job, and some servers firewall parts of the Azure range, so a runner can be
+# unable to open a TCP connection to a site that is serving everyone else
+# perfectly. Measured 2026-08-21: five parallel jobs received five distinct
+# egress IPs, and three of the five reached 34.174.188.233 while two were
+# blocked at the very same moment.
+#
+# So a verdict is a consensus, not one opinion:
+#   check    one runner tests every site
+#   verify   if anything failed, N more runners retest ONLY the failures
+#   report   a site is DOWN only if EVERY vantage point failed. If any vantage
+#            reached it, the site is up and the failure was local to a runner.
+#
+# The asymmetry matters: reaching a site proves it is serving, while failing to
+# reach it proves nothing on its own. The old single-runner design treated both
+# as equally conclusive, which is why it reported live sites as down.
+# ---------------------------------------------------------------------------
+
+CONNECTION_LEVEL = ("connect timeout", "read timeout", "connection refused",
+                    "connection reset", "connection error", "DNS failure")
+
+
+def runner_ip():
+    try:
+        return requests.get("https://api.ipify.org", timeout=10).text.strip()
+    except Exception:
+        return "unknown"
+
+
+def run_checks(urls, label):
+    print(f"[{label}] egress IP {runner_ip()}, checking {len(urls)} site(s), "
+          f"up to {ATTEMPTS} attempts each")
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        for r in pool.map(check, urls):
+            results.append(r)
+    results.sort(key=lambda r: r["url"])
+    for r in results:
+        state = "OK  " if r["ok"] else "FAIL"
+        print(f"{state}  {r['url']}  [{r['reason']}, {r['elapsed']:.1f}s, "
+              f"{r['ip'] or 'no ip'}]")
+    return results
+
+
+def write_json(path, label, results):
+    payload = {"vantage": label, "ip": runner_ip(), "results": results}
+    Path(path).write_text(json.dumps(payload, indent=1))
+
+
+def gh_output(**kv):
+    out = os.environ.get("GITHUB_OUTPUT")
+    if not out:
+        return
+    with open(out, "a") as f:
+        for k, v in kv.items():
+            f.write(f"{k}={v}\n")
+
+
+def classify(verdicts):
+    """verdicts is a list of (vantage_label, result) for one URL, across every
+    vantage that tested it. Returns (status, detail)."""
+    reached = [r for _, r in verdicts if r["ok"]]
+    failed = [r for _, r in verdicts if not r["ok"]]
+    n = len(verdicts)
+
+    if not failed:
+        return "ok", ""
+
+    if not reached:
+        reasons = sorted({r["reason"].split(" (")[0] for r in failed})
+        where = f"all {n} vantage points" if n > 1 else "the only vantage point"
+        return "down", f"{', '.join(reasons)}, failed from {where}"
+
+    # Mixed verdict. Something reached it, so the site is serving.
+    got = len(reached)
+    base = failed[0]["reason"].split(" (")[0]
+
+    if base in CONNECTION_LEVEL:
+        return "unreachable_from_some", (
+            f"reached from {got} of {n} vantage points. The other {n - got} "
+            f"could not open a connection ({base}), so those runner IPs are "
+            f"blocked by the server. The site itself is serving normally.")
+
+    if base == "slow":
+        slow = ", ".join(f"{r['elapsed']:.1f}s" for r in failed)
+        fast = ", ".join(f"{r['elapsed']:.1f}s" for r in reached)
+        return "intermittent", (
+            f"slow on {len(failed)} of {n} checks ({slow}) but fine on {got} "
+            f"({fast}). Intermittent, and it is server side.")
+
+    return "intermittent", (
+        f"{base} on {len(failed)} of {n} checks, fine on {got}. Intermittent.")
+
+
+def build_message(rows, total, vantages):
+    down = [r for r in rows if r["status"] == "down"]
+    unreach = [r for r in rows if r["status"] == "unreachable_from_some"]
+    flaky = [r for r in rows if r["status"] == "intermittent"]
+
+    if not (down or unreach or flaky):
+        return [f":white_check_mark: *Website Monitoring is done. "
+                f"All {total} websites are Active.*"]
+
+    lines = []
+    if down:
+        lines += [f":rotating_light: *{len(down)} of {total} sites DOWN*", ""]
+        for r in down:
+            lines.append(f"• <{r['url']}|{r['url']}> · {r['detail']}")
     else:
-        lines = [f":white_check_mark: *Website Monitoring is done. All {total} websites are Active.*"]
-    payload = {"text": "\n".join(lines)}
-    r = requests.post(webhook_url, json=payload, timeout=15)
+        lines += [f":white_check_mark: *No outage. All {total} sites are "
+                  f"reachable.*"]
+
+    if unreach:
+        lines += ["", ":information_source: *Blocked from some GitHub runners, "
+                  "NOT an outage*", ""]
+        for r in unreach:
+            lines.append(f"• <{r['url']}|{r['url']}> · {r['detail']}")
+
+    if flaky:
+        lines += ["", ":warning: *Intermittent, worth a look*", ""]
+        for r in flaky:
+            lines.append(f"• <{r['url']}|{r['url']}> · {r['detail']}")
+
+    lines += ["", f"_Verdicts are a consensus of up to {vantages} independent "
+              f"GitHub runners. A site is called DOWN only when every one of "
+              f"them failed to reach it._"]
+    return lines
+
+
+def send_slack(webhook_url, lines):
+    r = requests.post(webhook_url, json={"text": "\n".join(lines)}, timeout=15)
     r.raise_for_status()
 
 
-def main():
+def phase_check(args):
+    urls = load_sites()
+    if not urls:
+        print("ERROR: sites.txt has no active URLs", file=sys.stderr)
+        sys.exit(3)
+    results = run_checks(urls, "check")
+    write_json(args.out, "check", results)
+    failed = [r["url"] for r in results if not r["ok"]]
+    gh_output(has_failures=str(bool(failed)).lower(),
+              failures=json.dumps(failed))
+    tail = ", sending them for verification" if failed else ""
+    print(f"\n{len(failed)} of {len(results)} failed this pass{tail}")
+
+
+def phase_verify(args):
+    urls = json.loads(args.urls)
+    if not urls:
+        write_json(args.out, args.label, [])
+        return
+    write_json(args.out, args.label, run_checks(urls, args.label))
+
+
+def phase_report(args):
     webhook = os.environ.get("SLACK_WEBHOOK_URL")
     if not webhook:
         print("ERROR: SLACK_WEBHOOK_URL not set", file=sys.stderr)
         sys.exit(2)
 
-    urls = load_sites()
-    print(f"Checking {len(urls)} sites (up to {ATTEMPTS} attempts each)...")
+    files = sorted(Path(args.results_dir).rglob("*.json"))
+    payloads = [json.loads(f.read_text()) for f in files]
+    base = next((p for p in payloads if p["vantage"] == "check"), None)
+    if base is None:
+        print("ERROR: the check-phase result file is missing, so there is "
+              "nothing trustworthy to report", file=sys.stderr)
+        sys.exit(3)
 
-    results = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        for r in pool.map(check, urls):
-            results.append(r)
+    per_url = defaultdict(list)
+    for p in payloads:
+        for r in p["results"]:
+            per_url[r["url"]].append((p["vantage"], r))
 
-    results.sort(key=lambda r: r["url"])
-    for r in results:
-        status = "OK  " if r["ok"] else "FAIL"
-        retried = f", {r['attempts']} attempts" if r["attempts"] > 1 else ""
-        ip = f", {r['ip']}" if r["ip"] else ""
-        print(f"{status}  {r['url']}  [{r['reason']}, {r['elapsed']:.1f}s{ip}{retried}]")
+    rows = []
+    for r in base["results"]:
+        status, detail = classify(per_url[r["url"]])
+        rows.append({"url": r["url"], "status": status, "detail": detail})
 
-    failures = [r for r in results if not r["ok"]]
+    total = len(base["results"])
+    vantages = len(payloads)
+    print(f"vantage points reporting: {vantages} "
+          f"({', '.join(p['vantage'] + '=' + p['ip'] for p in payloads)})\n")
+    for row in rows:
+        if row["status"] != "ok":
+            print(f"{row['status'].upper():<22} {row['url']}  {row['detail']}")
 
     try:
-        send_slack(webhook, failures, len(results))
+        send_slack(webhook, build_message(rows, total, vantages))
     except Exception as e:
-        print(f"\nERROR: could not post to Slack: {e.__class__.__name__}: {e}",
+        print(f"ERROR: could not post to Slack: {e.__class__.__name__}: {e}",
               file=sys.stderr)
         sys.exit(3)
 
-    if failures:
-        print(f"\nAlert sent: {len(failures)} of {len(results)} failing.")
-    else:
-        print(f"\nAll {len(results)} sites OK. Success notification sent.")
-
-    # Exit 0 whether or not sites are down. Slack is the alert channel; a red
-    # run here means the MONITOR is broken (no webhook, Slack rejected, crash),
-    # which is the signal that was lost while every run failed on a dead domain.
+    counts = {k: sum(1 for r in rows if r["status"] == k)
+              for k in ("down", "unreachable_from_some", "intermittent")}
+    print(f"\nReported across {vantages} vantage point(s): "
+          f"{counts['down']} down, {counts['unreachable_from_some']} "
+          f"blocked-runner, {counts['intermittent']} intermittent.")
+    # Exit 0 regardless of what the sites did. Slack is the alert channel, so a
+    # red run means the MONITOR is broken.
     sys.exit(0)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Consensus uptime monitor.")
+    sub = ap.add_subparsers(dest="phase", required=True)
+
+    c = sub.add_parser("check")
+    c.add_argument("--out", default="result-check.json")
+
+    v = sub.add_parser("verify")
+    v.add_argument("--urls", required=True, help="JSON array of URLs")
+    v.add_argument("--label", required=True)
+    v.add_argument("--out", required=True)
+
+    r = sub.add_parser("report")
+    r.add_argument("--results-dir", default="results")
+
+    args = ap.parse_args()
+    {"check": phase_check,
+     "verify": phase_verify,
+     "report": phase_report}[args.phase](args)
 
 
 if __name__ == "__main__":
