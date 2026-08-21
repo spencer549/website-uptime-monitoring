@@ -312,8 +312,15 @@ def phase_report(args):
         if row["status"] != "ok":
             print(f"{row['status'].upper():<22} {row['url']}  {row['detail']}")
 
+    # Log the message verbatim so a past run can be read back from its own log
+    # instead of being reconstructed from the code.
+    message = build_message(rows, total, vantages)
+    print("\n--- message sent to Slack ---")
+    print("\n".join(message))
+    print("--- end message ---")
+
     try:
-        send_slack(webhook, build_message(rows, total, vantages))
+        send_slack(webhook, message)
     except Exception as e:
         print(f"ERROR: could not post to Slack: {e.__class__.__name__}: {e}",
               file=sys.stderr)
