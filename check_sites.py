@@ -20,6 +20,11 @@ SITES_FILE = Path(__file__).parent / "sites.txt"
 
 # One request at a time per server IP. Several monitored sites share a host,
 # so hitting them concurrently can manufacture the slowness we report.
+# Best-effort only: requests does its own DNS lookup, so a round-robin host or
+# a cross-host redirect can still land on a server we hold no lock for. It
+# removes the common case, it does not guarantee exclusivity. The lock is held
+# across the request, so a shared host that goes dark serialises its sites;
+# the workflow carries a timeout-minutes guard for that.
 _host_locks = defaultdict(threading.Lock)
 _locks_guard = threading.Lock()
 
