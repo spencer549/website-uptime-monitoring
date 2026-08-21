@@ -8,7 +8,10 @@ https://www.vmhlc.org/
 https://www.felipestaqueria.com/
 https://www.selectgaragedoorservice.com/
 https://www.tnstandard.com/
-https://antoinesfamouscakes.com/
+# 2026-08-21 DEAD: A record points at 67.202.92.31 (dead box).
+# Fix the A record to 198.60.193.31, then uncomment.
+# Failing every run since 2026-06-05.
+#https://antoinesfamouscakes.com/
 https://www.pechtlawfirm.com/
 http://rebounderz.com/
 https://terranceosborne.com/
