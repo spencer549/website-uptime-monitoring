@@ -1,0 +1,25 @@
+name: TEMP runner spread
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        vantage: [1, 2, 3, 4, 5]
+    steps:
+      - name: Probe from vantage ${{ matrix.vantage }}
+        run: |
+          IP=$(curl -s --max-time 15 https://api.ipify.org || echo UNKNOWN)
+          ok=0; fail=0
+          for i in 1 2 3 4 5 6; do
+            if timeout 8 bash -c "cat < /dev/null > /dev/tcp/34.174.188.233/443" 2>/dev/null; then
+              ok=$((ok+1)); else fail=$((fail+1)); fi
+            sleep 1
+          done
+          CODE=$(curl -sS -o /dev/null --max-time 25 -L -w '%{http_code}' https://www.teleleaf.com/ 2>/dev/null || echo 000)
+          echo "VANTAGE ${{ matrix.vantage }} ip=$IP teleleaf_tcp_ok=$ok/6 http=$CODE"
