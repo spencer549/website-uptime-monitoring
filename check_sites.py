@@ -218,16 +218,24 @@ def classify(verdicts):
         f"{base} on {len(failed)} of {n} checks, fine on {got}. Intermittent.")
 
 
-def build_message(rows, total, vantages):
+def build_message(rows, total, vantages, expected=None):
     down = [r for r in rows if r["status"] == "down"]
     unreach = [r for r in rows if r["status"] == "unreachable_from_some"]
     flaky = [r for r in rows if r["status"] == "intermittent"]
 
-    if not (down or unreach or flaky):
-        return [f":white_check_mark: *Website Monitoring is done. "
-                f"All {total} websites are Active.*"]
+    # If verification jobs died, we are back to a single opinion, which is the
+    # exact failure mode this design exists to remove. Say so out loud rather
+    # than letting a thin verdict read like a confirmed one.
+    short = expected is not None and vantages < expected
+    warn = ([f":grey_exclamation: *Only {vantages} of {expected} vantage points "
+             f"reported. Verification was incomplete, so treat any DOWN below "
+             f"as unconfirmed.*", ""] if short else [])
 
-    lines = []
+    if not (down or unreach or flaky):
+        return warn + [f":white_check_mark: *Website Monitoring is done. "
+                       f"All {total} websites are Active.*"]
+
+    lines = list(warn)
     if down:
         lines += [f":rotating_light: *{len(down)} of {total} sites DOWN*", ""]
         for r in down:
@@ -247,9 +255,10 @@ def build_message(rows, total, vantages):
         for r in flaky:
             lines.append(f"• <{r['url']}|{r['url']}> · {r['detail']}")
 
-    lines += ["", f"_Verdicts are a consensus of up to {vantages} independent "
-              f"GitHub runners. A site is called DOWN only when every one of "
-              f"them failed to reach it._"]
+    n = vantages
+    plural = "runner" if n == 1 else "independent runners"
+    lines += ["", f"_Verdict based on {n} GitHub {plural}. A site is called "
+              f"DOWN only when every one of them failed to reach it._"]
     return lines
 
 
@@ -306,15 +315,22 @@ def phase_report(args):
 
     total = len(base["results"])
     vantages = len(payloads)
-    print(f"vantage points reporting: {vantages} "
-          f"({', '.join(p['vantage'] + '=' + p['ip'] for p in payloads)})\n")
+    expected = args.expect_vantages
+    print(f"vantage points reporting: {vantages}"
+          + (f" of {expected} expected" if expected else "")
+          + f" ({', '.join(p['vantage'] + '=' + p['ip'] for p in payloads)})")
+    if expected and vantages < expected:
+        print(f"WARNING: {expected - vantages} verification vantage point(s) "
+              f"did not report. Verdicts are thinner than intended.",
+              file=sys.stderr)
+    print()
     for row in rows:
         if row["status"] != "ok":
             print(f"{row['status'].upper():<22} {row['url']}  {row['detail']}")
 
     # Log the message verbatim so a past run can be read back from its own log
     # instead of being reconstructed from the code.
-    message = build_message(rows, total, vantages)
+    message = build_message(rows, total, vantages, expected)
     print("\n--- message sent to Slack ---")
     print("\n".join(message))
     print("--- end message ---")
@@ -350,6 +366,10 @@ def main():
 
     r = sub.add_parser("report")
     r.add_argument("--results-dir", default="results")
+    r.add_argument("--expect-vantages", type=int, default=None,
+                   help="how many result files should have arrived; if fewer "
+                        "do, the report says so instead of presenting a thin "
+                        "verdict as a confirmed one")
 
     args = ap.parse_args()
     {"check": phase_check,

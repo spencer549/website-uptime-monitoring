@@ -52,11 +52,17 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: Re-test the failing sites from an independent runner
+        # The URL list goes through the environment, not through shell
+        # interpolation. Interpolating it directly would let a URL containing a
+        # quote break out of the argument.
+        env:
+          FAILURES: ${{ needs.check.outputs.failures }}
+          VANTAGE: ${{ matrix.vantage }}
         run: |
           python check_sites.py verify \
-            --urls '${{ needs.check.outputs.failures }}' \
-            --label 'verify-${{ matrix.vantage }}' \
-            --out 'result-verify-${{ matrix.vantage }}.json'
+            --urls "$FAILURES" \
+            --label "verify-$VANTAGE" \
+            --out "result-verify-$VANTAGE.json"
       - uses: actions/upload-artifact@v4
         with:
           name: result-verify-${{ matrix.vantage }}
@@ -82,6 +88,14 @@ jobs:
           path: results
           pattern: result-*
           merge-multiple: true
-      - run: python check_sites.py report --results-dir results
+      # Tell report how many result files should have arrived: 5 when the
+      # verify matrix ran, 1 when nothing failed and it was skipped. If fewer
+      # turn up, a verify job died and the report says so rather than passing
+      # off a single opinion as a confirmed verdict.
+      - run: |
+          python check_sites.py report \
+            --results-dir results \
+            --expect-vantages "$EXPECTED"
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          EXPECTED: ${{ needs.check.outputs.has_failures == 'true' && '5' || '1' }}
