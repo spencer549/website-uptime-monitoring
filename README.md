@@ -37,13 +37,24 @@ one reached it, the site is up and the failure belonged to that runner.
 Each site is also tried twice within a vantage, with a pause between, so a
 single blip never reaches the alert.
 
-### The three verdicts
+### The four verdicts
 
 | Verdict | Meaning | Renders as |
 |---|---|---|
 | DOWN | Every vantage point failed | Red alert |
-| Blocked from some runners | Some reached it, the others could not open a connection | Not an outage, informational |
+| Could not check: bot protection | Every vantage point got a firewall challenge page (Cloudflare, Sucuri or Imperva) | Not an outage, but not confirmed up either. Allowlist the monitor in that site's firewall to check it again |
+| Blocked from some runners | Some reached it, the others could not open a connection or got a challenge | Not an outage, informational |
 | Intermittent | Some reached it, the others got a slow response or an error | Warning |
+
+A challenge is recognised only by the firewall's own markers (Cloudflare's
+`cf-mitigated: challenge` header or its challenge and block pages, and the
+Sucuri and Imperva block pages; their headers alone do not count, since they
+sit on every proxied response). A plain 403, a Cloudflare 1xxx configuration
+error, or a 503 or 52x passed through from a failing origin is still an error
+and can still make a site DOWN. A challenge mixed only with runner connection
+failures is also "could not check"; mixed with any HTTP error it stays DOWN. Added
+2026-10-23 after Cloudflare Bot Fight Mode made rebounderz.com read as DOWN
+from every runner on 10-16 and 10-23 while it was serving visitors normally.
 
 ## What counts as a failure at a single vantage
 

@@ -58,6 +58,47 @@ def resolve(url):
         return None, f"DNS failure ({e.strerror or e})"
 
 
+# A bot-protection challenge is not an outage. Cloudflare Bot Fight Mode and
+# similar firewalls answer datacenter IPs (every GitHub runner) with a 403 or
+# 503 challenge page, so a site that is serving visitors normally fails from
+# all vantage points. Seen 2026-10-16 and 10-23: rebounderz.com reported DOWN
+# from 5 of 5 runners while it returned 200 to a normal connection.
+# The challenge only proves the firewall answered, not that the site behind it
+# is up, so these get their own status instead of being counted as up.
+BOT_BLOCK = "bot protection"
+BOT_STATUSES = (403, 429, 503)
+# Challenge and block pages only. Not "cf-error-details": Cloudflare's 1xxx
+# configuration-error pages use it too, and a broken DNS setup must stay DOWN.
+CLOUDFLARE_MARKERS = ("just a moment", "attention required", "cf-chl",
+                      "_cf_chl_opt", "sorry, you have been blocked")
+# Sucuri and Imperva put their headers on EVERY proxied response, including an
+# origin's own 503, so a header alone proves nothing. Require their block page.
+SUCURI_MARKERS = ("sucuri website firewall - access denied",
+                  "access denied - sucuri website firewall")
+IMPERVA_MARKERS = ("incapsula incident id", "request unsuccessful. incapsula")
+
+
+def bot_protection(resp):
+    """Name the firewall that challenged us, or None. Only a page carrying the
+    firewall's own challenge or block markers counts, so a real 503 passed
+    through from the origin is still reported as an error."""
+    if resp.status_code not in BOT_STATUSES:
+        return None
+    h = {k.lower(): v.lower() for k, v in resp.headers.items()}
+    # Slice the bytes before decoding: resp.text decodes the whole body first.
+    body = resp.content[:20000].decode("utf-8", "ignore").lower()
+    server = h.get("server", "")
+    if h.get("cf-mitigated") == "challenge":
+        return "Cloudflare"
+    if "cloudflare" in server and any(m in body for m in CLOUDFLARE_MARKERS):
+        return "Cloudflare"
+    if any(m in body for m in SUCURI_MARKERS):
+        return "Sucuri"
+    if any(m in body for m in IMPERVA_MARKERS):
+        return "Imperva"
+    return None
+
+
 def attempt(url, ip):
     start = time.monotonic()
     try:
@@ -69,6 +110,9 @@ def attempt(url, ip):
         )
         elapsed = time.monotonic() - start
         if resp.status_code >= 400:
+            shield = bot_protection(resp)
+            if shield:
+                return False, f"{BOT_BLOCK} ({shield}, HTTP {resp.status_code})", elapsed
             return False, f"HTTP {resp.status_code}", elapsed
         if elapsed > SLOW_THRESHOLD_SECONDS:
             return False, f"slow ({elapsed:.1f}s)", elapsed
@@ -192,14 +236,36 @@ def classify(verdicts):
     if not failed:
         return "ok", ""
 
+    where = f"all {n} vantage points" if n > 1 else "the only vantage point"
     if not reached:
         reasons = sorted({r["reason"].split(" (")[0] for r in failed})
-        where = f"all {n} vantage points" if n > 1 else "the only vantage point"
+        # A challenge proves the firewall answered. If the only other failures
+        # are runner-level connection problems, that is not an outage either.
+        # Any HTTP error or slowness from the site itself keeps it DOWN.
+        if BOT_BLOCK in reasons and all(x == BOT_BLOCK or x in CONNECTION_LEVEL
+                                        for x in reasons):
+            # Keep the firewall name and status, e.g. "Cloudflare, HTTP 403".
+            shields = sorted({r["reason"].split(" (", 1)[1].rstrip(")")
+                              for r in failed
+                              if r["reason"].startswith(BOT_BLOCK + " (")})
+            return "bot_blocked", (
+                f"{'; '.join(shields)} challenge from {where}. The firewall "
+                f"answered, so this is not an outage, but whether the site "
+                f"behind it is up cannot be confirmed from GitHub runners.")
         return "down", f"{', '.join(reasons)}, failed from {where}"
 
     # Mixed verdict. Something reached it, so the site is serving.
     got = len(reached)
-    base = failed[0]["reason"].split(" (")[0]
+    # Describe the failure by its most telling reason: a challenge says less
+    # about the site than an HTTP error or slowness does.
+    bases = [r["reason"].split(" (")[0] for r in failed]
+    base = next((b for b in bases if b != BOT_BLOCK), bases[0])
+
+    if all(r["reason"].split(" (")[0] == BOT_BLOCK for r in failed):
+        return "unreachable_from_some", (
+            f"reached from {got} of {n} vantage points. The other {n - got} "
+            f"got a bot-protection challenge. The site itself is serving "
+            f"normally.")
 
     if base in CONNECTION_LEVEL:
         return "unreachable_from_some", (
@@ -222,6 +288,7 @@ def build_message(rows, total, vantages, expected=None):
     down = [r for r in rows if r["status"] == "down"]
     unreach = [r for r in rows if r["status"] == "unreachable_from_some"]
     flaky = [r for r in rows if r["status"] == "intermittent"]
+    shielded = [r for r in rows if r["status"] == "bot_blocked"]
 
     # If verification jobs died, we are back to a single opinion, which is the
     # exact failure mode this design exists to remove. Say so out loud rather
@@ -231,7 +298,7 @@ def build_message(rows, total, vantages, expected=None):
              f"reported. Verification was incomplete, so treat any DOWN below "
              f"as unconfirmed.*", ""] if short else [])
 
-    if not (down or unreach or flaky):
+    if not (down or unreach or flaky or shielded):
         return warn + [f":white_check_mark: *Website Monitoring is done. "
                        f"All {total} websites are Active.*"]
 
@@ -240,9 +307,22 @@ def build_message(rows, total, vantages, expected=None):
         lines += [f":rotating_light: *{len(down)} of {total} sites DOWN*", ""]
         for r in down:
             lines.append(f"• <{r['url']}|{r['url']}> · {r['detail']}")
+    elif shielded:
+        # Never claim all sites are reachable when some could not be checked.
+        checked = total - len(shielded)
+        lines += [f":white_check_mark: *No outage. {checked} of {total} sites "
+                  f"are reachable; {len(shielded)} could not be checked.*"]
     else:
         lines += [f":white_check_mark: *No outage. All {total} sites are "
                   f"reachable.*"]
+
+    if shielded:
+        lines += ["", ":lock: *Could not check: bot protection blocks the "
+                  "monitor (NOT an outage)*", ""]
+        for r in shielded:
+            lines.append(f"• <{r['url']}|{r['url']}> · {r['detail']} To check "
+                         f"it again, allowlist the monitor in that site's "
+                         f"firewall.")
 
     if unreach:
         lines += ["", ":information_source: *Blocked from some GitHub runners, "
@@ -343,10 +423,12 @@ def phase_report(args):
         sys.exit(3)
 
     counts = {k: sum(1 for r in rows if r["status"] == k)
-              for k in ("down", "unreachable_from_some", "intermittent")}
+              for k in ("down", "unreachable_from_some", "intermittent",
+                        "bot_blocked")}
     print(f"\nReported across {vantages} vantage point(s): "
           f"{counts['down']} down, {counts['unreachable_from_some']} "
-          f"blocked-runner, {counts['intermittent']} intermittent.")
+          f"blocked-runner, {counts['intermittent']} intermittent, "
+          f"{counts['bot_blocked']} bot-protected.")
     # Exit 0 regardless of what the sites did. Slack is the alert channel, so a
     # red run means the MONITOR is broken.
     sys.exit(0)
